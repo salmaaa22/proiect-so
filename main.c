@@ -1,0 +1,608 @@
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef struct {
+    int id;
+    char inspector[64];
+    double latitude;
+    double longitude;
+    char category[50];
+    int severity;
+    time_t timestamp;
+    char description[128];
+} Report;
+
+void conversiePermisiuni(mode_t mode, char* out)
+{
+    if (mode & S_IRUSR)
+        out[0] = 'r';
+    else
+        out[0] = '-';
+    if (mode & S_IWUSR)
+        out[1] = 'w';
+    else
+        out[1] = '-';
+    if (mode & S_IXUSR)
+        out[2] = 'x';
+    else
+        out[2] = '-';
+
+    if (mode & S_IRGRP)
+        out[3] = 'r';
+    else
+        out[3] = '-';
+    if (mode & S_IWGRP)
+        out[4] = 'w';
+    else
+        out[4] = '-';
+    if (mode & S_IXGRP)
+        out[5] = 'x';
+    else
+        out[5] = '-';
+
+    if (mode & S_IROTH)
+        out[6] = 'r';
+    else
+        out[6] = '-';
+    if (mode & S_IWOTH)
+        out[7] = 'w';
+    else
+        out[7] = '-';
+    if (mode & S_IXOTH)
+        out[8] = 'x';
+    else
+        out[8] = '-';
+
+    out[9] = '\0';
+}
+
+void generatePath(char* filePath, const char* district, const char* filename)
+{
+    strcpy(filePath, district);
+    strcat(filePath, "/");
+    strcat(filePath, filename);
+}
+
+void logger(const char* district, const char* role, const char* user, const char* action)
+{
+    char path[256];
+    generatePath(path, district, "logged_district");
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd == -1)
+        return;
+
+    time_t now = time(NULL);
+    char line[512];
+    int len = snprintf(line, sizeof(line), "%ld\t%s\t%s\t%s\n", (long)now, user, role, action);
+    write(fd, line, len);
+    close(fd);
+}
+
+void init_district(const char* district)
+{
+    struct stat st;
+
+    if (stat(district, &st) == -1) {
+        mkdir(district, 0750);
+        chmod(district, 0750);
+    }
+
+    char path[256];
+
+    generatePath(path, district, "reports.dat");
+    if (stat(path, &st) == -1) {
+        int fd = open(path, O_WRONLY | O_CREAT, 0664);
+        if (fd != -1)
+            close(fd);
+        chmod(path, 0664);
+    }
+
+    generatePath(path, district, "district.cfg");
+    if (stat(path, &st) == -1) {
+        int fd = open(path, O_WRONLY | O_CREAT, 0640);
+        if (fd != -1) {
+            write(fd, "threshold=1\n", 12);
+            close(fd);
+        }
+        chmod(path, 0640);
+    }
+
+    generatePath(path, district, "logged_district");
+    if (stat(path, &st) == -1) {
+        int fd = open(path, O_WRONLY | O_CREAT, 0644);
+        if (fd != -1)
+            close(fd);
+        chmod(path, 0644);
+    }
+
+    char link_name[256];
+    char target[256];
+    strcpy(link_name, "active_reports-");
+    strcat(link_name, district);
+    generatePath(target, district, "reports.dat");
+
+    struct stat lst;
+    if (lstat(link_name, &lst) == 0) {
+        unlink(link_name);
+    }
+    symlink(target, link_name);
+}
+
+int verificaPermisiuniCitire(const char* filepath, const char* role)
+{
+    struct stat st;
+    if (stat(filepath, &st) == -1) {
+        printf("fisierul %s nu exista\n", filepath);
+        return 0;
+    }
+
+    mode_t mode = st.st_mode;
+
+    if (strcmp(role, "manager") == 0) {
+        if (!(mode & S_IRUSR)) {
+            printf("managerul nu are drept de citire\n");
+            return 0;
+        }
+    } else {
+        if (!(mode & S_IRGRP)) {
+            printf("inspectorul nu are drept de citire");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int verificaPermisiuniScriere(const char* filepath, const char* role)
+{
+    struct stat st;
+    if (stat(filepath, &st) == -1) {
+        return 1;
+    }
+
+    mode_t mode = st.st_mode;
+
+    if (strcmp(role, "manager") == 0) {
+        if (!(mode & S_IWUSR)) {
+            printf("managerul nu are drept de scriere");
+            return 0;
+        }
+    } else {
+        if (!(mode & S_IWGRP)) {
+            printf("inspectorul nu are drept de scriere");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void adaugaRaport(const char* district, const char* role, const char* user)
+{
+    init_district(district);
+
+    char path[256];
+    generatePath(path, district, "reports.dat");
+
+    if (!verificaPermisiuniScriere(path, role))
+        return;
+
+    struct stat st;
+    stat(path, &st);
+    int num_records = (int)(st.st_size / sizeof(Report));
+
+    Report r;
+    memset(&r, 0, sizeof(Report));
+
+    r.id = num_records + 1;
+    strncpy(r.inspector, user, sizeof(r.inspector) - 1);
+    r.timestamp = time(NULL);
+
+    printf("Latitudine: ");
+    scanf("%lf", &r.latitude);
+    printf("Longitudine: ");
+    scanf("%lf", &r.longitude);
+
+    printf("Categ: ");
+    scanf("%31s", r.category);
+
+    printf("Severitate(1/2/3): ");
+    scanf("%d", &r.severity);
+
+    getchar();
+    printf("Descriere: ");
+    fgets(r.description, sizeof(r.description), stdin);
+
+    int dlen = strlen(r.description);
+    if (dlen > 0 && r.description[dlen - 1] == '\n') {
+        r.description[dlen - 1] = '\0';
+    }
+
+    int fd = open(path, O_WRONLY | O_APPEND, 0664);
+    if (fd == -1) {
+        printf("Eroare la deschidere fisier: %s\n", path);
+        return;
+    }
+
+    write(fd, &r, sizeof(Report));
+    close(fd);
+
+    printf("Raport adaugat");
+    logger(district, role, user, "add");
+}
+
+void afiseazaRapoarte(const char* district, const char* role)
+{
+    char path[256];
+    generatePath(path, district, "reports.dat");
+
+    if (!verificaPermisiuniCitire(path, role))
+        return;
+
+    struct stat st;
+    if (stat(path, &st) == -1) {
+        printf("Districtul nu exista/nu are rapoarte \n");
+        return;
+    }
+
+    char perms[10];
+    conversiePermisiuni(st.st_mode, perms);
+    char* mtime = ctime(&st.st_mtime);
+    mtime[strlen(mtime) - 1] = '\0';
+
+    printf("Permisiuni: %s  \t  Marime: %ld bytes  \t  Modificat: %s\n\n", perms, (long)st.st_size, mtime);
+
+    int num_records = (int)(st.st_size / sizeof(Report));
+    if (num_records == 0) {
+        printf("Nu exista rapoarte in district");
+        return;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        printf("Eroare la deschidere fisier %s \n", path);
+        return;
+    }
+
+    Report r;
+    while (read(fd, &r, sizeof(Report)) == sizeof(Report)) {
+        char* ts = ctime(&r.timestamp);
+        ts[strlen(ts) - 1] = '\0';
+        printf("%d. Inspector: %s \t Categorie: %s \t Severitate: %d \t %s\n", r.id, r.inspector, r.category, r.severity, ts);
+    }
+
+    close(fd);
+}
+
+void veziRaport(const char* district, const char* role, int report_id)
+{
+    char path[256];
+    generatePath(path, district, "reports.dat");
+
+    if (!verificaPermisiuniCitire(path, role))
+        return;
+
+    struct stat st;
+    if (stat(path, &st) == -1) {
+        printf("Districtul %s nu exista.\n", district);
+        return;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        printf("Eroare la deschidere fisier %s \n", path);
+        return;
+    }
+
+    Report r;
+    int found = 0;
+    while (read(fd, &r, sizeof(Report)) == sizeof(Report)) {
+        if (r.id == report_id) {
+            found = 1;
+            break;
+        }
+    }
+    close(fd);
+
+    if (!found) {
+        printf("raportul nu s-a gasit\n");
+        return;
+    }
+
+    char* ts = ctime(&r.timestamp);
+    ts[strlen(ts) - 1] = '\0';
+
+    printf("Raport %d \n", r.id);
+    printf("Inspector: %s\n", r.inspector);
+    printf("Coordonate: lat=%.6f, lon=%.6f\n", r.latitude, r.longitude);
+    printf("Categorie: %s\n", r.category);
+    printf("Severitate: %d\n", r.severity);
+    printf("Timestamp: %s\n", ts);
+    printf("Descriere: %s\n", r.description);
+}
+
+void stergeRaport(const char* district, const char* role, int report_id)
+{
+    if (strcmp(role, "manager") != 0) {
+        printf("Eroare permisiuni\n");
+        return;
+    }
+
+    char path[256];
+    generatePath(path, district, "reports.dat");
+
+    struct stat st;
+    if (stat(path, &st) == -1) {
+        printf("Districtul nu exista.\n");
+        return;
+    }
+
+    int num_records = (int)(st.st_size / sizeof(Report));
+
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        printf("Eroare la deschidere fisier %s \n", path);
+        return;
+    }
+
+    Report* records = malloc(num_records * sizeof(Report));
+    if (!records) {
+        printf("Eroare la malloc\n");
+        close(fd);
+        return;
+    }
+
+    for (int i = 0; i < num_records; i++) {
+        read(fd, &records[i], sizeof(Report));
+    }
+    close(fd);
+
+    int idx = -1;
+    for (int i = 0; i < num_records; i++) {
+        if (records[i].id == report_id) {
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx == -1) {
+        printf("Raportul %d nu exista in districtul %s.\n", report_id, district);
+        free(records);
+        return;
+    }
+
+    fd = open(path, O_WRONLY);
+    if (fd == -1) {
+        printf("Eroare deschidere fisier");
+        free(records);
+        return;
+    }
+
+    for (int i = 0; i < num_records; i++) {
+        if (i != idx) {
+            write(fd, &records[i], sizeof(Report));
+        }
+    }
+
+    ftruncate(fd, (num_records - 1) * sizeof(Report));
+    close(fd);
+    free(records);
+
+    printf("Raportul %d a fost sters din districtul %s.\n", report_id, district);
+    logger(district, role, "manager", "remove_report");
+}
+
+void actualizeazaThreshold(const char* district, const char* role, int value)
+{
+    if (strcmp(role, "manager") != 0) {
+        printf("Eroare permisiuni\n");
+        return;
+    }
+
+    char path[256];
+    generatePath(path, district, "district.cfg");
+
+    struct stat st;
+    if (stat(path, &st) == -1) {
+        printf("Eroare fisierul %s nu exista\n", path);
+        return;
+    }
+
+    mode_t perms = st.st_mode & 0777;
+    if (perms != 0640) {
+        char perms_str[10];
+        conversiePermisiuni(st.st_mode, perms_str);
+        printf("Eroare permisiuni\n");
+        return;
+    }
+
+    int fd = open(path, O_WRONLY | O_TRUNC);
+    if (fd == -1) {
+        printf("Eroare deschidere fisier");
+        return;
+    }
+
+    char line[32];
+    int len = snprintf(line, sizeof(line), "threshold=%d\n", value);
+    write(fd, line, len);
+    close(fd);
+
+    printf("Threshold actualizat");
+    logger(district, role, "manager", "update_threshold");
+}
+
+int parse_condition(const char* input, char* field, char* op, char* value)
+{
+    const char* p1 = strchr(input, ':');
+    if (!p1)
+        return 0;
+
+    int field_len = (int)(p1 - input);
+    strncpy(field, input, field_len);
+    field[field_len] = '\0';
+
+    const char* p2 = strchr(p1 + 1, ':');
+    if (!p2)
+        return 0;
+
+    int op_len = (int)(p2 - p1 - 1);
+    strncpy(op, p1 + 1, op_len);
+    op[op_len] = '\0';
+    strcpy(value, p2 + 1);
+    return 1;
+}
+
+int match_condition(Report* r, const char* field, const char* op, const char* value)
+{
+    if (strcmp(field, "severity") == 0) {
+        int val = atoi(value);
+        int sev = r->severity;
+        if (strcmp(op, "==") == 0)
+            return sev == val;
+        if (strcmp(op, "!=") == 0)
+            return sev != val;
+        if (strcmp(op, "<") == 0)
+            return sev < val;
+        if (strcmp(op, "<=") == 0)
+            return sev <= val;
+        if (strcmp(op, ">") == 0)
+            return sev > val;
+        if (strcmp(op, ">=") == 0)
+            return sev >= val;
+    }
+
+    if (strcmp(field, "category") == 0) {
+        int cmp = strcmp(r->category, value);
+        if (strcmp(op, "==") == 0)
+            return cmp == 0;
+        if (strcmp(op, "!=") == 0)
+            return cmp != 0;
+    }
+
+    if (strcmp(field, "inspector") == 0) {
+        int cmp = strcmp(r->inspector, value);
+        if (strcmp(op, "==") == 0)
+            return cmp == 0;
+        if (strcmp(op, "!=") == 0)
+            return cmp != 0;
+    }
+
+    if (strcmp(field, "timestamp") == 0) {
+        long val = atol(value);
+        long ts = (long)r->timestamp;
+        if (strcmp(op, "==") == 0)
+            return ts == val;
+        if (strcmp(op, "!=") == 0)
+            return ts != val;
+        if (strcmp(op, "<") == 0)
+            return ts < val;
+        if (strcmp(op, "<=") == 0)
+            return ts <= val;
+        if (strcmp(op, ">") == 0)
+            return ts > val;
+        if (strcmp(op, ">=") == 0)
+            return ts >= val;
+    }
+
+    return 0;
+}
+
+void filter_reports(const char* district, const char* role, char** conditions, int num_conditions)
+{
+    char path[256];
+    generatePath(path, district, "reports.dat");
+
+    if (!verificaPermisiuniCitire(path, role))
+        return;
+
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        printf("Eroare deschidere fisier");
+        return;
+    }
+
+    char fields[10][32];
+    char ops[10][8];
+    char values[10][64];
+    for (int i = 0; i < num_conditions; i++) {
+        if (!parse_condition(conditions[i], fields[i], ops[i], values[i])) {
+            printf("Eroare conditie: %s\n", conditions[i]);
+            close(fd);
+            return;
+        }
+    }
+
+    Report r;
+    int found = 0;
+
+    while (read(fd, &r, sizeof(Report)) == sizeof(Report)) {
+        int match = 1;
+        for (int i = 0; i < num_conditions; i++) {
+            if (!match_condition(&r, fields[i], ops[i], values[i])) {
+                match = 0;
+                break;
+            }
+        }
+        if (match) {
+            found++;
+            char* ts = ctime(&r.timestamp);
+            ts[strlen(ts) - 1] = '\0';
+            printf("%d.) %-20s \t %-10s \t sev:%d \t %s \t %s\n", r.id, r.inspector, r.category, r.severity, ts, r.description);
+        }
+    }
+
+    close(fd);
+
+    if (found == 0) {
+        printf("Nu s-au gasit rapoarte\n");
+    }
+}
+
+int main(int argc, char* argv[])
+{
+    char* role = NULL;
+    char* user = NULL;
+    char* command = NULL;
+    int cmd_idx = -1;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--role") == 0 && i + 1 < argc) {
+            role = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--user") == 0 && i + 1 < argc) {
+            user = argv[i + 1];
+            i++;
+        } else if (argv[i][0] == '-' && argv[i][1] == '-') {
+            command = argv[i] + 2;
+            cmd_idx = i;
+            break;
+        }
+    }
+
+    if (strcmp(command, "add") == 0) {
+        adaugaRaport(argv[cmd_idx + 1], role, user);
+    } else if (strcmp(command, "list") == 0) {
+        afiseazaRapoarte(argv[cmd_idx + 1], role);
+    } else if (strcmp(command, "view") == 0) {
+        int rid = atoi(argv[cmd_idx + 2]);
+        veziRaport(argv[cmd_idx + 1], role, rid);
+    } else if (strcmp(command, "remove_report") == 0) {
+        int rid = atoi(argv[cmd_idx + 2]);
+        stergeRaport(argv[cmd_idx + 1], role, rid);
+    } else if (strcmp(command, "update_threshold") == 0) {
+        int val = atoi(argv[cmd_idx + 2]);
+        actualizeazaThreshold(argv[cmd_idx + 1], role, val);
+    } else if (strcmp(command, "filter") == 0) {
+        char* district = argv[cmd_idx + 1];
+        char** conditions = &argv[cmd_idx + 2];
+        int num_cond = argc - cmd_idx - 2;
+        filter_reports(district, role, conditions, num_cond);
+    }
+
+    return 0;
+}
