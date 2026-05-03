@@ -69,12 +69,38 @@ void generatePath(char* filePath, const char* district, const char* filename)
     strcat(filePath, filename);
 }
 
+int esteRolValid(const char* role)
+{
+    return role != NULL && (strcmp(role, "manager") == 0 || strcmp(role, "inspector") == 0);
+}
+
 void logger(const char* district, const char* role, const char* user, const char* action)
 {
     char path[256];
     generatePath(path, district, "logged_district");
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    struct stat st;
+    if (stat(path, &st) == -1) {
+        int cfd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (cfd == -1)
+            return;
+        close(cfd);
+        chmod(path, 0644);
+    }
+
+    if (strcmp(role, "manager") != 0) {
+        printf("Rolul %s nu are drept de scriere in %s\n", role, path);
+        return;
+    }
+
+    if (stat(path, &st) == 0) {
+        if (!(st.st_mode & S_IWUSR)) {
+            printf("managerul nu are drept de scriere in %s\n", path);
+            return;
+        }
+    }
+
+    int fd = open(path, O_WRONLY | O_APPEND);
     if (fd == -1)
         return;
 
@@ -143,6 +169,11 @@ int verificaPermisiuniCitire(const char* filepath, const char* role)
         return 0;
     }
 
+    if (!esteRolValid(role)) {
+        printf("rol invalid: %s\n", role ? role : "(null)");
+        return 0;
+    }
+
     mode_t mode = st.st_mode;
 
     if (strcmp(role, "manager") == 0) {
@@ -163,7 +194,13 @@ int verificaPermisiuniScriere(const char* filepath, const char* role)
 {
     struct stat st;
     if (stat(filepath, &st) == -1) {
-        return 1;
+        printf("fisierul %s nu exista\n", filepath);
+        return 0;
+    }
+
+    if (!esteRolValid(role)) {
+        printf("rol invalid: %s\n", role ? role : "(null)");
+        return 0;
     }
 
     mode_t mode = st.st_mode;
@@ -209,7 +246,7 @@ void adaugaRaport(const char* district, const char* role, const char* user)
     scanf("%lf", &r.longitude);
 
     printf("Categ: ");
-    scanf("%31s", r.category);
+    scanf("%49s", r.category);
 
     printf("Severitate(1/2/3): ");
     scanf("%d", &r.severity);
@@ -336,35 +373,36 @@ void stergeRaport(const char* district, const char* role, int report_id)
     char path[256];
     generatePath(path, district, "reports.dat");
 
+    if (!verificaPermisiuniScriere(path, role))
+        return;
+
     struct stat st;
     if (stat(path, &st) == -1) {
         printf("Districtul nu exista.\n");
         return;
     }
-
     int num_records = (int)(st.st_size / sizeof(Report));
 
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDWR);
     if (fd == -1) {
         printf("Eroare la deschidere fisier %s \n", path);
         return;
     }
 
-    Report* records = malloc(num_records * sizeof(Report));
-    if (!records) {
-        printf("Eroare la malloc\n");
-        close(fd);
-        return;
-    }
-
-    for (int i = 0; i < num_records; i++) {
-        read(fd, &records[i], sizeof(Report));
-    }
-    close(fd);
-
+    Report r;
     int idx = -1;
     for (int i = 0; i < num_records; i++) {
-        if (records[i].id == report_id) {
+        if (lseek(fd, i * sizeof(Report), SEEK_SET) == -1) {
+            printf("lseek error\n");
+            close(fd);
+            return;
+        }
+        if (read(fd, &r, sizeof(Report)) != sizeof(Report)) {
+            printf("read error\n");
+            close(fd);
+            return;
+        }
+        if (r.id == report_id) {
             idx = i;
             break;
         }
@@ -372,26 +410,40 @@ void stergeRaport(const char* district, const char* role, int report_id)
 
     if (idx == -1) {
         printf("Raportul %d nu exista in districtul %s.\n", report_id, district);
-        free(records);
+        close(fd);
         return;
     }
 
-    fd = open(path, O_WRONLY);
-    if (fd == -1) {
-        printf("Eroare deschidere fisier");
-        free(records);
-        return;
-    }
-
-    for (int i = 0; i < num_records; i++) {
-        if (i != idx) {
-            write(fd, &records[i], sizeof(Report));
+    /* Shift records after idx one position earlier using lseek/read/write */
+    Report tmp;
+    for (int i = idx + 1; i < num_records; i++) {
+        if (lseek(fd, i * sizeof(Report), SEEK_SET) == -1) {
+            printf("lseek error\n");
+            close(fd);
+            return;
+        }
+        if (read(fd, &tmp, sizeof(Report)) != sizeof(Report)) {
+            printf("read error during shift\n");
+            close(fd);
+            return;
+        }
+        if (lseek(fd, (i - 1) * sizeof(Report), SEEK_SET) == -1) {
+            printf("lseek error\n");
+            close(fd);
+            return;
+        }
+        if (write(fd, &tmp, sizeof(Report)) != sizeof(Report)) {
+            printf("write error during shift\n");
+            close(fd);
+            return;
         }
     }
 
-    ftruncate(fd, (num_records - 1) * sizeof(Report));
+    if (ftruncate(fd, (num_records - 1) * sizeof(Report)) == -1) {
+        printf("ftruncate error\n");
+    }
+
     close(fd);
-    free(records);
 
     printf("Raportul %d a fost sters din districtul %s.\n", report_id, district);
     logger(district, role, "manager", "remove_report");
@@ -438,12 +490,19 @@ void actualizeazaThreshold(const char* district, const char* role, int value)
 
 int parse_condition(const char* input, char* field, char* op, char* value)
 {
+    /* size limits must match buffers used in filter_reports */
+    #define FIELD_SZ 32
+    #define OP_SZ 8
+    #define VAL_SZ 64
+
     const char* p1 = strchr(input, ':');
     if (!p1)
         return 0;
 
     int field_len = (int)(p1 - input);
-    strncpy(field, input, field_len);
+    if (field_len <= 0 || field_len >= FIELD_SZ)
+        return 0;
+    memcpy(field, input, field_len);
     field[field_len] = '\0';
 
     const char* p2 = strchr(p1 + 1, ':');
@@ -451,9 +510,17 @@ int parse_condition(const char* input, char* field, char* op, char* value)
         return 0;
 
     int op_len = (int)(p2 - p1 - 1);
-    strncpy(op, p1 + 1, op_len);
+    if (op_len <= 0 || op_len >= OP_SZ)
+        return 0;
+    memcpy(op, p1 + 1, op_len);
     op[op_len] = '\0';
-    strcpy(value, p2 + 1);
+
+    const char* val = p2 + 1;
+    size_t val_len = strlen(val);
+    if (val_len == 0 || val_len >= VAL_SZ)
+        return 0;
+    strncpy(value, val, VAL_SZ - 1);
+    value[VAL_SZ - 1] = '\0';
     return 1;
 }
 
@@ -474,6 +541,8 @@ int match_condition(Report* r, const char* field, const char* op, const char* va
             return sev > val;
         if (strcmp(op, ">=") == 0)
             return sev >= val;
+        /* unsupported operator */
+        return 0;
     }
 
     if (strcmp(field, "category") == 0) {
@@ -482,6 +551,7 @@ int match_condition(Report* r, const char* field, const char* op, const char* va
             return cmp == 0;
         if (strcmp(op, "!=") == 0)
             return cmp != 0;
+        return 0;
     }
 
     if (strcmp(field, "inspector") == 0) {
@@ -490,6 +560,7 @@ int match_condition(Report* r, const char* field, const char* op, const char* va
             return cmp == 0;
         if (strcmp(op, "!=") == 0)
             return cmp != 0;
+        return 0;
     }
 
     if (strcmp(field, "timestamp") == 0) {
@@ -507,6 +578,7 @@ int match_condition(Report* r, const char* field, const char* op, const char* va
             return ts > val;
         if (strcmp(op, ">=") == 0)
             return ts >= val;
+        return 0;
     }
 
     return 0;
@@ -584,24 +656,66 @@ int main(int argc, char* argv[])
         }
     }
 
+    if (command == NULL) {
+        fprintf(stderr, "No command specified\n");
+        return 1;
+    }
+
+    if (!esteRolValid(role)) {
+        fprintf(stderr, "Invalid or missing --role. Use manager or inspector.\n");
+        return 1;
+    }
+
+    if (user == NULL || user[0] == '\0') {
+        fprintf(stderr, "Invalid or missing --user.\n");
+        return 1;
+    }
+
     if (strcmp(command, "add") == 0) {
+        if (cmd_idx + 1 >= argc) {
+            fprintf(stderr, "Usage: --add <district_id>\n");
+            return 1;
+        }
         adaugaRaport(argv[cmd_idx + 1], role, user);
     } else if (strcmp(command, "list") == 0) {
+        if (cmd_idx + 1 >= argc) {
+            fprintf(stderr, "Usage: --list <district_id>\n");
+            return 1;
+        }
         afiseazaRapoarte(argv[cmd_idx + 1], role);
     } else if (strcmp(command, "view") == 0) {
+        if (cmd_idx + 2 >= argc) {
+            fprintf(stderr, "Usage: --view <district_id> <report_id>\n");
+            return 1;
+        }
         int rid = atoi(argv[cmd_idx + 2]);
         veziRaport(argv[cmd_idx + 1], role, rid);
     } else if (strcmp(command, "remove_report") == 0) {
+        if (cmd_idx + 2 >= argc) {
+            fprintf(stderr, "Usage: --remove_report <district_id> <report_id>\n");
+            return 1;
+        }
         int rid = atoi(argv[cmd_idx + 2]);
         stergeRaport(argv[cmd_idx + 1], role, rid);
     } else if (strcmp(command, "update_threshold") == 0) {
+        if (cmd_idx + 2 >= argc) {
+            fprintf(stderr, "Usage: --update_threshold <district_id> <value>\n");
+            return 1;
+        }
         int val = atoi(argv[cmd_idx + 2]);
         actualizeazaThreshold(argv[cmd_idx + 1], role, val);
     } else if (strcmp(command, "filter") == 0) {
+        if (cmd_idx + 1 >= argc) {
+            fprintf(stderr, "Usage: --filter <district_id> <condition> [condition...]\n");
+            return 1;
+        }
         char* district = argv[cmd_idx + 1];
         char** conditions = &argv[cmd_idx + 2];
         int num_cond = argc - cmd_idx - 2;
         filter_reports(district, role, conditions, num_cond);
+    } else {
+        fprintf(stderr, "Unknown command: %s\n", command);
+        return 1;
     }
 
     return 0;
