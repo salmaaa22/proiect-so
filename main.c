@@ -1,9 +1,12 @@
 #include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -17,6 +20,13 @@ typedef struct {
     time_t timestamp;
     char description[128];
 } Report;
+
+typedef struct {
+    long value;
+    int valid;
+} MonitorPidInfo;
+
+void logger(const char* district, const char* role, const char* user, const char* action);
 
 void conversiePermisiuni(mode_t mode, char* out)
 {
@@ -69,6 +79,86 @@ void generatePath(char* filePath, const char* district, const char* filename)
     strcat(filePath, filename);
 }
 
+void generateLinkName(char* link_name, const char* district)
+{
+    strcpy(link_name, "active_reports-");
+    strcat(link_name, district);
+}
+
+int districtNameIsSafe(const char* district)
+{
+    return district != NULL && district[0] != '\0' && strchr(district, '/') == NULL && strcmp(district, ".") != 0 && strcmp(district, "..") != 0;
+}
+
+int readFileContent(const char* path, char* buffer, size_t buffer_size)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd == -1)
+        return -1;
+
+    ssize_t total = read(fd, buffer, buffer_size - 1);
+    close(fd);
+    if (total < 0)
+        return -1;
+    buffer[total] = '\0';
+    return 0;
+}
+
+MonitorPidInfo readMonitorPid(void)
+{
+    MonitorPidInfo info;
+    info.value = -1;
+    info.valid = 0;
+
+    char buffer[64];
+    if (readFileContent(".monitor_pid", buffer, sizeof(buffer)) == -1)
+        return info;
+
+    char* end = NULL;
+    errno = 0;
+    long pid = strtol(buffer, &end, 10);
+    if (errno != 0 || end == buffer || pid <= 0)
+        return info;
+
+    info.value = pid;
+    info.valid = 1;
+    return info;
+}
+
+int notifyMonitorAndReport(const char* district, const char* role, const char* user, const char* action)
+{
+    MonitorPidInfo info = readMonitorPid();
+    char message[256];
+
+    if (!info.valid) {
+        snprintf(message, sizeof(message), "%s: monitor could not be informed (%s)", action, "missing or invalid .monitor_pid");
+        logger(district, role, user, message);
+        return 0;
+    }
+
+    if (kill((pid_t)info.value, SIGUSR1) == -1) {
+        snprintf(message, sizeof(message), "%s: monitor could not be informed (kill failed: %s)", action, strerror(errno));
+        logger(district, role, user, message);
+        return 0;
+    }
+
+    snprintf(message, sizeof(message), "%s: monitor informed successfully (pid=%ld)", action, info.value);
+    logger(district, role, user, message);
+    return 1;
+}
+
+int removeLinkedReportsSymlink(const char* district)
+{
+    char link_name[256];
+    generateLinkName(link_name, district);
+
+    struct stat lst;
+    if (lstat(link_name, &lst) == -1)
+        return 0;
+
+    return unlink(link_name) == 0;
+}
+
 int esteRolValid(const char* role)
 {
     return role != NULL && (strcmp(role, "manager") == 0 || strcmp(role, "inspector") == 0);
@@ -115,6 +205,9 @@ void init_district(const char* district)
 {
     struct stat st;
 
+    if (!districtNameIsSafe(district))
+        return;
+
     if (stat(district, &st) == -1) {
         mkdir(district, 0750);
         chmod(district, 0750);
@@ -150,15 +243,22 @@ void init_district(const char* district)
 
     char link_name[256];
     char target[256];
-    strcpy(link_name, "active_reports-");
-    strcat(link_name, district);
     generatePath(target, district, "reports.dat");
+    generateLinkName(link_name, district);
 
     struct stat lst;
     if (lstat(link_name, &lst) == 0) {
         unlink(link_name);
     }
     symlink(target, link_name);
+}
+
+int districtHasExpectedCfgPermissions(const char* path)
+{
+    struct stat st;
+    if (stat(path, &st) == -1)
+        return 0;
+    return (st.st_mode & 0777) == 0640;
 }
 
 int verificaPermisiuniCitire(const char* filepath, const char* role)
@@ -270,7 +370,13 @@ void adaugaRaport(const char* district, const char* role, const char* user)
     close(fd);
 
     printf("Raport adaugat");
-    logger(district, role, user, "add");
+
+    if (strcmp(role, "manager") == 0)
+        logger(district, role, user, "add");
+    else
+        printf("\nInspectorul nu are drept de scriere in logged_district; raportul a fost adaugat fara jurnalizare.");
+
+    notifyMonitorAndReport(district, role, user, "add");
 }
 
 void afiseazaRapoarte(const char* district, const char* role)
@@ -363,7 +469,7 @@ void veziRaport(const char* district, const char* role, int report_id)
     printf("Descriere: %s\n", r.description);
 }
 
-void stergeRaport(const char* district, const char* role, int report_id)
+void stergeRaport(const char* district, const char* role, const char* user, int report_id)
 {
     if (strcmp(role, "manager") != 0) {
         printf("Eroare permisiuni\n");
@@ -446,10 +552,10 @@ void stergeRaport(const char* district, const char* role, int report_id)
     close(fd);
 
     printf("Raportul %d a fost sters din districtul %s.\n", report_id, district);
-    logger(district, role, "manager", "remove_report");
+    logger(district, role, user, "remove_report");
 }
 
-void actualizeazaThreshold(const char* district, const char* role, int value)
+void actualizeazaThreshold(const char* district, const char* role, const char* user, int value)
 {
     if (strcmp(role, "manager") != 0) {
         printf("Eroare permisiuni\n");
@@ -467,8 +573,6 @@ void actualizeazaThreshold(const char* district, const char* role, int value)
 
     mode_t perms = st.st_mode & 0777;
     if (perms != 0640) {
-        char perms_str[10];
-        conversiePermisiuni(st.st_mode, perms_str);
         printf("Eroare permisiuni\n");
         return;
     }
@@ -485,7 +589,49 @@ void actualizeazaThreshold(const char* district, const char* role, int value)
     close(fd);
 
     printf("Threshold actualizat");
-    logger(district, role, "manager", "update_threshold");
+    logger(district, role, user, "update_threshold");
+}
+
+void stergeDistrict(const char* district, const char* role, const char* user)
+{
+    if (strcmp(role, "manager") != 0) {
+        printf("Eroare permisiuni\n");
+        return;
+    }
+
+    if (!districtNameIsSafe(district)) {
+        printf("District invalid\n");
+        return;
+    }
+
+    char district_path[256];
+    snprintf(district_path, sizeof(district_path), "%s", district);
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        printf("Eroare fork\n");
+        return;
+    }
+
+    if (pid == 0) {
+        execlp("rm", "rm", "-rf", district_path, (char*)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) == -1) {
+        printf("Eroare waitpid\n");
+        return;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        printf("Stergerea districtului a esuat\n");
+        return;
+    }
+
+    removeLinkedReportsSymlink(district);
+    printf("Districtul %s a fost sters\n", district);
+    logger(district, role, user, "remove_district");
 }
 
 int parse_condition(const char* input, char* field, char* op, char* value)
@@ -521,6 +667,48 @@ int parse_condition(const char* input, char* field, char* op, char* value)
         return 0;
     strncpy(value, val, VAL_SZ - 1);
     value[VAL_SZ - 1] = '\0';
+    return 1;
+}
+
+int validateReportFilePermissions(const char* path, const char* role, int for_write)
+{
+    struct stat st;
+    if (stat(path, &st) == -1) {
+        printf("fisierul %s nu exista\n", path);
+        return 0;
+    }
+
+    if (!esteRolValid(role)) {
+        printf("rol invalid: %s\n", role ? role : "(null)");
+        return 0;
+    }
+
+    if (for_write) {
+        if (strcmp(role, "manager") == 0) {
+            if (!(st.st_mode & S_IWUSR)) {
+                printf("managerul nu are drept de scriere\n");
+                return 0;
+            }
+        } else {
+            if (!(st.st_mode & S_IWGRP)) {
+                printf("inspectorul nu are drept de scriere\n");
+                return 0;
+            }
+        }
+    } else {
+        if (strcmp(role, "manager") == 0) {
+            if (!(st.st_mode & S_IRUSR)) {
+                printf("managerul nu are drept de citire\n");
+                return 0;
+            }
+        } else {
+            if (!(st.st_mode & S_IRGRP)) {
+                printf("inspectorul nu are drept de citire\n");
+                return 0;
+            }
+        }
+    }
+
     return 1;
 }
 
@@ -696,14 +884,14 @@ int main(int argc, char* argv[])
             return 1;
         }
         int rid = atoi(argv[cmd_idx + 2]);
-        stergeRaport(argv[cmd_idx + 1], role, rid);
+        stergeRaport(argv[cmd_idx + 1], role, user, rid);
     } else if (strcmp(command, "update_threshold") == 0) {
         if (cmd_idx + 2 >= argc) {
             fprintf(stderr, "Usage: --update_threshold <district_id> <value>\n");
             return 1;
         }
         int val = atoi(argv[cmd_idx + 2]);
-        actualizeazaThreshold(argv[cmd_idx + 1], role, val);
+        actualizeazaThreshold(argv[cmd_idx + 1], role, user, val);
     } else if (strcmp(command, "filter") == 0) {
         if (cmd_idx + 1 >= argc) {
             fprintf(stderr, "Usage: --filter <district_id> <condition> [condition...]\n");
@@ -713,6 +901,12 @@ int main(int argc, char* argv[])
         char** conditions = &argv[cmd_idx + 2];
         int num_cond = argc - cmd_idx - 2;
         filter_reports(district, role, conditions, num_cond);
+    } else if (strcmp(command, "remove_district") == 0) {
+        if (cmd_idx + 1 >= argc) {
+            fprintf(stderr, "Usage: --remove_district <district_id>\n");
+            return 1;
+        }
+        stergeDistrict(argv[cmd_idx + 1], role, user);
     } else {
         fprintf(stderr, "Unknown command: %s\n", command);
         return 1;

@@ -1,0 +1,8 @@
+1777831074	alice	manager	add
+1777831085	manager	manager	remove_report
+1778438868	alice	manager	add
+1778438868	alice	manager	add: monitor could not be informed (missing or invalid .monitor_pid)
+1778438868	alice	manager	add
+1778438868	alice	manager	add: monitor could not be informed (missing or invalid .monitor_pid)
+1778438890	alice	manager	add
+1778438890	alice	manager	add: monitor could not be informed (missing or invalid .monitor_pid)
